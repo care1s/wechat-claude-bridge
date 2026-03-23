@@ -8,3 +8,8 @@
 2. npm install 安装以来
 3. npm run login 微信扫码认证
 4. npm start 启动桥接器
+
+
+## 使用
+1. 直接对话，claude api进行回复
+2. /cli 代码问题，可支持代码保存在本地
