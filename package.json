@@ -1,0 +1,22 @@
+{
+  "name": "weixin-claude-bridge",
+  "version": "1.0.0",
+  "description": "微信-Claude 桥接服务 - 直接接入微信协议",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "api": "node src/api-server.js",
+    "receive": "node src/receive.js",
+    "cli": "node cli.js",
+    "login": "node src/login.js",
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "qrcode-terminal": "^0.12.0",
+    "dotenv": "^16.4.5"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
