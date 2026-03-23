@@ -7,12 +7,69 @@ import { config, loadSavedToken, validateConfig } from './config.js';
 import { getUpdates, sendTextMessage, getConfig, sendTyping } from './weixin-api.js';
 import { sessionStore } from './session-store.js';
 import { getClaudeClient } from './claude-client.js';
+import { writeFileSync, readFileSync, existsSync, mkdirSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+
+// 任务队列目录
+const DATA_DIR = join(homedir(), '.weixin-claude-bridge');
+const OUTPUT_DIR = join(DATA_DIR, 'outputs');
+
+// 确保目录存在
+if (!existsSync(DATA_DIR)) {
+  mkdirSync(DATA_DIR, { recursive: true });
+}
+if (!existsSync(OUTPUT_DIR)) {
+  mkdirSync(OUTPUT_DIR, { recursive: true });
+}
 
 // 运行状态
 let isRunning = true;
 let syncBuf = '';
 let consecutiveErrors = 0;
 const MAX_ERRORS = 5;
+
+/**
+ * 添加任务到队列
+ */
+function addTask(userId, text, contextToken) {
+  const tasks = existsSync(TASKS_FILE) ? JSON.parse(readFileSync(TASKS_FILE, 'utf-8')) : [];
+  const task = {
+    id: Date.now().toString(36),
+    userId,
+    text,
+    contextToken,
+    createdAt: Date.now(),
+    status: 'waiting', // waiting: 等待Claude处理
+  };
+  tasks.push(task);
+  writeFileSync(TASKS_FILE, JSON.stringify(tasks.slice(-50), null, 2));
+  return task;
+}
+
+/**
+ * 更新任务状态
+ */
+function updateTask(taskId, status, result = null) {
+  if (!existsSync(TASKS_FILE)) return;
+  const tasks = JSON.parse(readFileSync(TASKS_FILE, 'utf-8'));
+  const task = tasks.find(t => t.id === taskId);
+  if (task) {
+    task.status = status;
+    if (result) task.result = result;
+    task.updatedAt = Date.now();
+    writeFileSync(TASKS_FILE, JSON.stringify(tasks, null, 2));
+  }
+}
+
+/**
+ * 保存待回复消息
+ */
+function savePendingReply(userId, message, contextToken) {
+  const pending = existsSync(PENDING_FILE) ? JSON.parse(readFileSync(PENDING_FILE, 'utf-8')) : [];
+  pending.push({ userId, message, contextToken, createdAt: Date.now() });
+  writeFileSync(PENDING_FILE, JSON.stringify(pending.slice(-20), null, 2));
+}
 
 /**
  * 提取消息文本
@@ -77,7 +134,7 @@ function splitMessage(text, maxLength = 4000) {
 }
 
 /**
- * 处理单条消息 - 自动 AI 回复
+ * 处理单条消息 - 混合模式
  */
 async function handleMessage(msg) {
   // 只处理用户消息
@@ -132,6 +189,103 @@ async function handleMessage(msg) {
     return;
   }
 
+  // ========== CLI 任务模式 ==========
+  // 如果以 /cli 开头，自动执行并回复
+  if (text.startsWith('/cli ')) {
+    const command = text.slice(5).trim();
+    console.log(`   🚀 CLI 任务: ${command}`);
+
+    // 发送"处理中"通知
+    await sendTextMessage(
+      config.weixinBaseUrl,
+      config.weixinBotToken,
+      userId,
+      `⏳ 任务接收: ${command.substring(0, 30)}${command.length > 30 ? '...' : ''}\n正在生成代码，请稍候...`,
+      contextToken
+    );
+
+    try {
+      // 调用 AI 生成代码
+      const claude = getClaudeClient();
+      const prompt = `请生成完成以下任务的代码:\n${command}\n\n要求:\n1. 提供完整的可运行代码\n2. 包含必要的注释\n3. 如果是算法，提供测试用例\n4. 说明如何使用\n5. 代码用 markdown 代码块包裹，标明语言`;
+
+      console.log('   🤖 AI 正在生成代码...');
+      const response = await claude.ask(prompt, []);
+
+      // 提取代码块
+      let result = response.content;
+      let savedFiles = [];
+
+      // 匹配所有代码块
+      const codeBlockRegex = /```(\w+)?\n([\s\S]*?)```/g;
+      let match;
+      let fileIndex = 0;
+
+      while ((match = codeBlockRegex.exec(response.content)) !== null) {
+        const lang = match[1] || 'txt';
+        const code = match[2];
+
+        // 根据语言确定扩展名
+        const extMap = {
+          javascript: 'js', js: 'js',
+          typescript: 'ts', ts: 'ts',
+          python: 'py', py: 'py',
+          java: 'java',
+          go: 'go',
+          rust: 'rs',
+          c: 'c',
+          cpp: 'cpp', 'c++': 'cpp',
+          html: 'html',
+          css: 'css',
+          json: 'json',
+          yaml: 'yml', yml: 'yml',
+          markdown: 'md', md: 'md',
+          bash: 'sh', shell: 'sh', sh: 'sh',
+          sql: 'sql',
+        };
+
+        const ext = extMap[lang.toLowerCase()] || 'txt';
+        const fileName = `task_${Date.now()}_${fileIndex || ''}.${ext}`;
+        const filePath = join(OUTPUT_DIR, fileName);
+
+        writeFileSync(filePath, code);
+        savedFiles.push({ name: fileName, path: filePath, lang });
+        fileIndex++;
+      }
+
+      // 构建简洁的成功消息（不包含代码内容）
+      let successMsg = '';
+      if (savedFiles.length > 0) {
+        successMsg = `✅ 生成成功！\n\n📁 共保存 ${savedFiles.length} 个文件:\n${savedFiles.map(f => `  • ${f.name}`).join('\n')}\n\n📂 文件位置:\n${OUTPUT_DIR}\n\n💡 在 CLI 中查看代码:\ncat ${savedFiles[0].path}`;
+        console.log(`   ✅ 任务完成！已保存 ${savedFiles.length} 个文件`);
+      } else {
+        successMsg = `✅ 生成成功！（无代码块保存）`;
+        console.log(`   ✅ 任务完成！无代码块保存`);
+      }
+
+      // 只发送状态信息（不包含代码内容）
+      await sendTextMessage(
+        config.weixinBaseUrl,
+        config.weixinBotToken,
+        userId,
+        successMsg,
+        contextToken
+      );
+
+    } catch (err) {
+      console.error(`   ❌ 任务失败:`, err.message);
+      await sendTextMessage(
+        config.weixinBaseUrl,
+        config.weixinBotToken,
+        userId,
+        `❌ 生成失败！\n\n错误信息: ${err.message}\n\n请重试或联系管理员`,
+        contextToken
+      );
+    }
+    return;
+  }
+
+  // ========== 自动 AI 回复模式 ==========
   // 获取历史对话
   const history = sessionStore.getHistory(config.weixinAccountId, userId);
 
