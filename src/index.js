@@ -8,6 +8,7 @@ import { getUpdates } from './weixin-api.js';
 import { getClaudeClient } from './claude-client.js';
 import { sessionStore } from './session-store.js';
 import { handleMessage } from './message-handler.js';
+import { startTaskProcessor } from './task-queue.js';
 
 // 运行状态
 let isRunning = true;
@@ -56,7 +57,11 @@ async function main() {
     process.exit(1);
   }
 
-  // 4. 启动消息轮询
+  // 4. 启动后台任务处理器
+  startTaskProcessor(3000); // 每3秒检查一次任务队列
+  console.log('✓ 后台任务处理器已启动\n');
+
+  // 5. 启动消息轮询
   console.log('🚀 启动消息轮询服务...\n');
   console.log('按 Ctrl+C 停止服务\n');
 

@@ -7,6 +7,7 @@
     "start": "node src/index.js",
     "api": "node src/api-server.js",
     "receive": "node src/receive.js",
+    "processor": "node src/task-processor.js",
     "cli": "node cli.js",
     "login": "node src/login.js",
     "dev": "node --watch src/index.js"

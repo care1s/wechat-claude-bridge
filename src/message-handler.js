@@ -1,12 +1,14 @@
 /**
  * 消息处理器
  * 处理微信消息并调用 Claude
+ * 支持智能模式：简单对话即时回复，复杂任务后台处理
  * @author carels
  */
 import { config } from './config.js';
 import { getClaudeClient } from './claude-client.js';
 import { sessionStore } from './session-store.js';
 import { sendTextMessage, sendTyping, getConfig, MessageItemType } from './weixin-api.js';
+import { addTask, processTaskQueue } from './task-queue.js';
 
 // 特殊命令
 const COMMANDS = {
@@ -95,7 +97,39 @@ async function indicateTyping(baseUrl, token, userId, contextToken) {
 }
 
 /**
- * 处理单条消息
+ * 使用 AI 判断消息类型
+ * @returns {Promise<{type: 'simple'|'complex', reason: string}>}
+ */
+async function classifyMessage(text) {
+  const claude = getClaudeClient();
+
+  const prompt = `请分析以下用户消息，判断这是"简单对话"还是"复杂任务"。
+
+判断标准：
+- 简单对话：日常聊天、问答、问候、简单解释、观点交流（可在30秒内回复）
+- 复杂任务：写代码、生成文件、数据分析、需要多步骤处理、耗时操作
+
+用户消息："""${text}"""
+
+请只返回 JSON 格式，不要其他内容：
+{
+  "type": "simple" 或 "complex",
+  "reason": "判断理由（一句话）"
+}`;
+
+  try {
+    const response = await claude.ask(prompt, []);
+    const result = JSON.parse(response.content.replace(/```json\n?|\n?```/g, '').trim());
+    console.log(`[智能分类] 消息类型: ${result.type}, 理由: ${result.reason}`);
+    return result;
+  } catch (e) {
+    console.log('[智能分类] 解析失败，默认为简单对话');
+    return { type: 'simple', reason: '默认判断' };
+  }
+}
+
+/**
+ * 处理单条消息 - 智能模式
  */
 export async function handleMessage(msg, baseUrl, token, accountId) {
   console.log(`[调试] 处理消息: type=${msg.message_type}, from=${msg.from_user_id}`);
@@ -141,46 +175,84 @@ export async function handleMessage(msg, baseUrl, token, accountId) {
     return;
   }
 
-  // 获取当前会话的历史
-  const history = sessionStore.getHistory(accountId, userId);
+  // 智能判断消息类型
+  const classification = await classifyMessage(text);
 
-  // 发送"正在输入"状态
-  try {
-    await indicateTyping(baseUrl, token, userId, contextToken);
-  } catch (e) {
-    console.log('[调试] indicateTyping 失败（非关键）:', e.message);
-  }
+  if (classification.type === 'complex') {
+    // 复杂任务：创建任务队列，后台处理
+    console.log(`[智能处理] 识别为复杂任务，创建后台任务`);
 
-  try {
-    // 调用 Claude
-    console.log('[调试] 正在调用 Claude API...');
-    const claude = getClaudeClient();
-    const response = await claude.ask(text, history);
-    console.log('[调试] Claude 返回:', response.content?.substring(0, 50) + '...');
-
-    // 保存对话历史
-    sessionStore.addMessage(accountId, userId, 'user', text);
-    sessionStore.addMessage(accountId, userId, 'assistant', response.content);
-
-    // 发送回复（分段发送，微信单条限制约4000字）
-    const reply = response.content;
-    const chunks = splitMessage(reply, 4000);
-
-    for (const chunk of chunks) {
-      await sendTextMessage(baseUrl, token, userId, chunk, contextToken);
-    }
-
-    console.log(`[回复] 已发送 ${chunks.length} 条消息，共 ${reply.length} 字`);
-
-  } catch (err) {
-    console.error('Claude API 错误:', err.message);
+    // 通知用户任务已创建
     await sendTextMessage(
       baseUrl,
       token,
       userId,
-      '抱歉，处理消息时出现错误，请稍后重试。',
+      `⏳ 收到复杂任务，正在后台处理...\n任务内容：${text.substring(0, 50)}${text.length > 50 ? '...' : ''}\n\n完成后会通知您。`,
       contextToken
     );
+
+    // 创建任务
+    const task = await addTask({
+      userId,
+      text,
+      contextToken,
+      accountId,
+      baseUrl,
+      token,
+    });
+
+    console.log(`[智能处理] 任务已创建: ${task.id}`);
+
+    // 启动后台处理（不等待完成）
+    processTaskQueue().catch(err => {
+      console.error('[任务处理] 后台处理出错:', err.message);
+    });
+
+  } else {
+    // 简单对话：即时回复
+    console.log(`[智能处理] 识别为简单对话，即时回复`);
+
+    // 发送"正在输入"状态
+    try {
+      await indicateTyping(baseUrl, token, userId, contextToken);
+    } catch (e) {
+      console.log('[调试] indicateTyping 失败（非关键）:', e.message);
+    }
+
+    try {
+      // 获取当前会话的历史
+      const history = sessionStore.getHistory(accountId, userId);
+
+      // 调用 Claude
+      console.log('[调试] 正在调用 Claude API...');
+      const claude = getClaudeClient();
+      const response = await claude.ask(text, history);
+      console.log('[调试] Claude 返回:', response.content?.substring(0, 50) + '...');
+
+      // 保存对话历史
+      sessionStore.addMessage(accountId, userId, 'user', text);
+      sessionStore.addMessage(accountId, userId, 'assistant', response.content);
+
+      // 发送回复
+      const reply = response.content;
+      const chunks = splitMessage(reply, 4000);
+
+      for (const chunk of chunks) {
+        await sendTextMessage(baseUrl, token, userId, chunk, contextToken);
+      }
+
+      console.log(`[回复] 已发送 ${chunks.length} 条消息，共 ${reply.length} 字`);
+
+    } catch (err) {
+      console.error('Claude API 错误:', err.message);
+      await sendTextMessage(
+        baseUrl,
+        token,
+        userId,
+        '抱歉，处理消息时出现错误，请稍后重试。',
+        contextToken
+      );
+    }
   }
 }
 

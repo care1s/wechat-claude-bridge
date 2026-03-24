@@ -41,7 +41,8 @@ function showHelp() {
   inbox                     查看收件箱（收到的消息）
   reply <消息ID> <内容>      回复指定消息
   tasks                     查看任务队列
-  complete <任务ID> [结果]   ✅ 标记任务完成，自动发送微信通知
+  complete <任务ID> [结果]   标记任务完成，自动发送微信通知
+  watch                     👀 实时监听模式（自动显示新消息和任务）
   history <用户ID>          查看用户消息历史
   logs [数量]               查看最近消息日志 (默认20条)
   send <用户ID> <消息>      发送消息给用户
@@ -320,6 +321,55 @@ switch (cmd) {
     console.log('✅ 任务完成，结果已发送到微信');
     console.log(`   任务: ${task.text.substring(0, 50)}`);
     console.log(`   结果: "${result.substring(0, 100)}"`);
+    break;
+  }
+
+  case 'watch': {
+    console.log('👀 启动实时监听模式，按 Ctrl+C 退出\n');
+    let lastInboxLength = 0;
+    let lastTasksLength = 0;
+
+    const check = () => {
+      // 检查收件箱
+      if (existsSync(INBOX_FILE)) {
+        const inbox = JSON.parse(readFileSync(INBOX_FILE, 'utf-8'));
+        const unread = inbox.filter(m => !m.replied);
+        if (inbox.length > lastInboxLength) {
+          const newMsgs = inbox.slice(lastInboxLength);
+          newMsgs.forEach(m => {
+            console.log(`\n📩 新消息 [${m.id}]`);
+            console.log(`   来自: ${m.userId}`);
+            console.log(`   内容: "${m.text.substring(0, 100)}${m.text.length > 100 ? '...' : ''}"`);
+            console.log(`   回复: node cli.js reply ${m.id} "你的回复"`);
+          });
+          lastInboxLength = inbox.length;
+        }
+      }
+
+      // 检查任务
+      if (existsSync(TASKS_FILE)) {
+        const tasks = JSON.parse(readFileSync(TASKS_FILE, 'utf-8'));
+        if (tasks.length > lastTasksLength) {
+          const newTasks = tasks.slice(lastTasksLength);
+          newTasks.forEach(t => {
+            console.log(`\n📋 新任务 [${t.id}]`);
+            console.log(`   用户: ${t.userId}`);
+            console.log(`   内容: "${t.text.substring(0, 100)}${t.text.length > 100 ? '...' : ''}"`);
+            console.log(`   完成: node cli.js complete ${t.id} "结果"`);
+          });
+          lastTasksLength = tasks.length;
+        }
+      }
+    };
+
+    // 立即检查一次
+    check();
+
+    // 每秒检查一次
+    setInterval(check, 1000);
+
+    // 保持进程运行
+    setInterval(() => {}, 1000);
     break;
   }
 
